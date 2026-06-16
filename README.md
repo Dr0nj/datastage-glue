@@ -14,6 +14,10 @@ operando só com arquivos em S3 (sem Oracle). Entrada: XML ~20GB. Saídas: XML c
 |---|---|
 | `glue_ctcr_cadoc3040_optimized.py` | **O job** — único arquivo que sobe no AWS Glue 5.0 |
 | `tests/smoke_test.py` | Smoke test local (PySpark 3.5) das expressões: extração v-codes/Inf/Gar, PicPay, IPOC de reneg, query CTRL_DIVDA_RENEG, montagem do XML 2026 |
+| `MANUTENCAO-COMENTARIOS.md` | Como manter os comentários de regra do `.py` honestos ao alterar (tags `[DSX]`/`[BACEN]`/`[ANALISTA]`/`[PENDENTE]`) |
+
+> O `glue_ctcr_cadoc3040_optimized.py` começa com um bloco-cabeçalho **"REGRAS DE NEGÓCIO"**
+> (índice + tags de proveniência). Antes de mexer numa regra, leia o `MANUTENCAO-COMENTARIOS.md`.
 
 ## Rodar o job (Glue 5.0 / Spark 3.5)
 

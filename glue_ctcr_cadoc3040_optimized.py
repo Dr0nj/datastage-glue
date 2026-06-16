@@ -53,6 +53,41 @@ Opcionais (iguais ao original): --FINAL_SINGLE_FILE --GENERATE_SUPPLIER_FILES
   --FINAL_XML_PPBANK_NAME --FINAL_XML_BASE_RUN_OFF_NAME --DOWNDIRCONTAS_PATH
 """
 
+# =============================================================================
+# REGRAS DE NEGOCIO (indice) -- LEIA antes de alterar qualquer logica
+# =============================================================================
+# Este .py e o UNICO artefato que sobe no Glue. O contexto profundo (historico,
+# decisoes, validacoes) vive FORA dele, em:
+#     projects/Glue-datastage/MELHORIAS.md   (fonte unica de status/regras)
+#     projects/Glue-datastage/README.md      (historico detalhado)
+# Aqui ficam so o "porque + fonte" das regras nao-obvias. Tags de proveniencia:
+#     [DSX]      derivacao do DataStage (export 2026-06-15, job cadoc3040_ctcr)
+#     [BACEN]    exigencia do validador oficial (Release 13657) / leiaute SCR3040
+#     [ANALISTA] regra confirmada pelo analista de negocio
+#     [PENDENTE] NAO confirmado / suspeita -- NAO tratar como regra estabelecida
+#
+# MANUTENCAO: ao mudar uma logica marcada com tag, ATUALIZE o comentario/tag aqui
+# E registre a mudanca no MELHORIAS.md. Guia de manutencao dos comentarios:
+#     projects/Glue-datastage/MANUTENCAO-COMENTARIOS.md
+#
+# Mapa das regras (o detalhe esta inline, no ponto de uso):
+#   * Leitura splittable do XML ~20GB (spark-xml rowTag=Cli) ......... performance
+#   * [BACEN] S81 : CNPJ do header == CNPJ8 do IPOC no PPBANK (PPBANK_CNPJ8)
+#   * [BACEN] B01 : ordem dos filhos de <Op> = Venc, Gar, Inf, ContInstFinRes4966
+#   * [DSX] Reneg : query CTRL_DIVDA_RENEG -> WHERE IND_RENEG>1 AND NUM_ORGNZ=212
+#                   AND HOR_ATULZ>SYSDATE-65; VerificaReneg='1' DERIVADO (nao e coluna)
+#   * [DSX] PicPay: Tp_2='0316' & Qtd='2' & nao-reneg -> Tp_2='0301' e zera Cd_2/Ident/Valor/Qtd
+#   * [ANALISTA] IPOC reneg: '0951641902991' (= cnpj8 09516419 + 0299 + 1) + cpf(11) + contrato(15)
+#   * [ANALISTA] RunOff/CTA_DIA: downdircontas pos 592='S' (RunOff); conta pos 7 tam 19;
+#                exclusao por status pos 83/84 ou atraso pos 171 tam 5; match conta vs Contrt[1..19]
+#   * [DSX] Cd_2 : passa direto (rewrite '0299' REMOVIDO no DSX 15/06)
+#   * [DSX] dedup vRegDuplicado REMOVIDA no DSX 15/06 (ramos usam so FiltroTabela)
+#   * Daily imutavel: instances congeladas; TotalCli = nº de blocos <Cli> por arquivo
+#   * [PENDENTE] cpf_tratamento/Cd_1 e CPF(14) calculados e NAO emitidos no XML;
+#                pad CPF p/ 11 no IPOC; cpf_deletar_contrato/is_tp_0316 calculados e nunca aplicados;
+#                C83/I13 (regras de arquivo do validador ainda nao implementadas)
+# =============================================================================
+
 import io
 import re
 import sys
@@ -104,7 +139,7 @@ KEEP_WORK_PARQUET = _optional_arg('KEEP_WORK_PARQUET', 'true').lower() in {'1', 
 # homologacao vs DataStage; sao pequenos). Default = manter mesmo com KEEP_WORK_PARQUET=false.
 KEEP_AUDIT = _optional_arg('KEEP_AUDIT', 'true').lower() in {'1', 'true', 'yes', 'y'}
 PPBANK_HEADER_CNPJ = _optional_arg('P_CNPJ', '')
-# Regra S81 do validador Bacen: o CNPJ do header <Doc3040> e os 8 primeiros
+# [BACEN] Regra S81 do validador: o CNPJ do header <Doc3040> e os 8 primeiros
 # digitos do IPOC de TODAS as Op precisam ser o MESMO valor. No arquivo PPBANK
 # usamos um unico CNPJ8 nos dois lugares: o --P_CNPJ se informado, senao o
 # default historico 09516419 (mesmo prefixo que o DataStage aplicava ao IPOC).
@@ -610,6 +645,12 @@ def _derive_downdircontas_lookups(path):
     if not lines_df.columns:
         return _safe_empty_lookup(['CONTA', 'FLAG', 'NUM_ORGNZ']), _safe_empty_lookup(['NUM_CTA_CATAO', 'MOD'])
 
+    # [ANALISTA] regras dos arquivos posicionais downdircontas (ex-tabelas Oracle), confirmadas:
+    #   - RunOff (BASE_RUN_OFF): RUNOFF_IND pos 592 == 'S'  ->  conta DIA_CONTA = pos 7 tam 19
+    #   - exclusao CTA_DIA (Mod 1904): status pos 83 OU pos 84 em status_runoff_values
+    #                                  OU atraso pos 171 tam 5 > 5; chave = conta + Mod '1904'
+    #   - linha < 175 chars e NUM_ORGNZ (pos 1-3) in {000,999} = header/trailer -> descartadas
+    # (status_runoff_values e a lista de status de EXCLUSAO CTA_DIA -- nome historico; rename em MELHORIAS item 10)
     status_runoff_values = ['B', 'H', 'I', 'J', 'L', 'M', 'Q', 'S', 'U', 'Y', 'X']
     parsed_df = lines_df.filter(F.col('line').isNotNull()).filter(F.length(F.col('line')) >= 175).withColumn(
         'NUM_ORGNZ', F.substring(F.col('line'), 1, 3)
@@ -771,7 +812,7 @@ base_run_off_lookup = base_run_off_lookup_from_files.unionByName(
     allowMissingColumns=True,
 ).dropDuplicates(['CONTA'])
 
-# CTRL_DIVDA_RENEG: o arquivo no S3 e o DUMP CRU da tabela CTPL.CTRL_DIVDA_RENEG. Sem
+# [DSX] CTRL_DIVDA_RENEG: o arquivo no S3 e o DUMP CRU da tabela CTPL.CTRL_DIVDA_RENEG. Sem
 # Oracle, o Glue replica a query INTEIRA do DataStage (DSX 2026-06-15) sobre o dump:
 #   WHERE IND_RENEG > 1 AND NUM_ORGNZ = 212 AND HOR_ATULZ > SYSDATE - 65
 #   SELECT IND_DOCTO->CliCd, trim(NUM_OPER)->Contrt19, mes(DAT_PROCM)->MES_MOVTO_ACORD,
@@ -992,6 +1033,10 @@ copy_xml_df = op_base_df.join(
 ).drop('cpf_tratamento_cd')
 copy_xml_df = copy_xml_df.withColumn('Contrt19', F.substring(F.trim(F.col('Contrt')), 1, 19))
 copy_xml_df = copy_xml_df.withColumn('NUM_CTA_CATAO', _clean_account(F.col('Contrt')))
+# [PENDENTE] cpf_tratamento (CdTratado) e Cd_1 sao calculados aqui, mas o XML final
+# emite o 'Cd' CRU no <Cli Cd=...> (ver cli_attrs em _build_xml_fragments) -- Cd_1 NAO
+# e emitido. Confirmar com o analista se a saida deveria usar o CPF substituido
+# (CdTratado). Se o lookup cpf_tratamento estiver vazio, Cd_1==Cd (Tp=1) e nao muda nada.
 copy_xml_df = copy_xml_df.withColumn('CdTratadoFinal', F.coalesce(F.col('CdTratado'), F.col('Cd')))
 copy_xml_df = copy_xml_df.withColumn('Cd_1', F.when(F.trim(F.col('Tp')) == '1', F.col('CdTratadoFinal')).otherwise(F.col('DetCli')))
 copy_xml_df = copy_xml_df.withColumn(
@@ -1011,6 +1056,9 @@ copy_xml_df = copy_xml_df.join(
     'cpf_deletar_contrato', F.coalesce(F.col('cpf_excluir'), F.lit(0))
 ).drop('cpf_excluir')
 
+# [PENDENTE] cpf_deletar_contrato e is_tp_0316 sao calculados mas NENHUM filtro os aplica
+# (nao ha exclusao de operacao em lugar nenhum do job). No DataStage havia exclusao? Pode
+# ser parte da resposta de I13 (cliente com soma de vencimentos < R$200). Decidir com o negocio.
 copy_xml_df = copy_xml_df.withColumn('is_tp_0316', F.col('Tp_2') == F.lit('0316'))
 
 # Stage LKP_CONTA / OC_CTA_DIA -> exclusao por conta + modalidade fixa 1904.
@@ -1033,7 +1081,7 @@ ctrl_window = Window.partitionBy('Contrt19').orderBy(F.col('Contrt19'))
 ctrl_dedup_df = ctrl_divda_reneg_lookup.withColumn('rn_ctrl', F.row_number().over(ctrl_window)).filter(F.col('rn_ctrl') == 1).drop('rn_ctrl')
 with_reneg_df = with_cta_df.join(F.broadcast(ctrl_dedup_df), 'Contrt19', 'left')
 
-# Stage Trf_Reneg -> regra "operacao baixada PicPay" (DSX 2026-06-15):
+# [DSX] Stage Trf_Reneg -> regra "operacao baixada PicPay" (export 2026-06-15):
 #   vOperBaixadaPipcay = 1 quando Tp_2 = '0316' e Qtd = '2'.
 #   Quando a Op NAO e renegociada (VerificaReneg != 1) E e baixada PicPay,
 #   zera Cd_2/Ident/Valor/Qtd e troca Tp_2 para '0301'.
@@ -1053,8 +1101,10 @@ with_reneg_df = with_reneg_df.withColumn(
     'Tp_2', F.when(_aplica_baixada_pipcay, F.lit('0301')).otherwise(F.col('Tp_2'))
 )
 
-# Stage Trf_Reneg -> IPOC de renegociacao (DSX 2026-06-15). So para operacoes
-# renegociadas (VerificaReneg = 1) o IPOC e reconstruido; senao mantem o de origem:
+# [DSX][ANALISTA] Stage Trf_Reneg -> IPOC de renegociacao. So para operacoes
+# renegociadas (VerificaReneg = 1) o IPOC e reconstruido; senao mantem o de origem.
+# Estrutura confirmada pelo analista: cnpj8(09516419) + '0299' + '1' + cpf(11) + contrato(15)
+# == prefixo fixo '0951641902991' + vCnpjCpf + vContratoNew, onde:
 #   vCnpjCpf     = Cd (se Tp = '1') senao DetCli[1..8]
 #   vContratoNew = NUM_OPER_RENEG_PCELD ajustado a 15 posicoes (zeros a esquerda)
 #   vIPOC        = '0951641902991' + trim(vCnpjCpf) + vContratoNew
@@ -1073,6 +1123,9 @@ with_reneg_df = with_reneg_df.withColumn(
 )
 
 # Stage TRF_IDENT -> normalizacao CPF, TpCtrl e CaracEspecial.
+# [PENDENTE] 'CPF' aqui e o Cd com 14 posicoes (zeros a esquerda), mas NAO e emitido no
+# XML (o <Cli Cd> usa o Cd cru). Mantido por paridade/carga. Confirmar se a saida precisa
+# do documento padronizado (11 PF / 14 PJ) -- hoje depende do formato que vem na entrada.
 trf_ident_df = with_reneg_df.withColumn('CPF', F.expr("right(concat('00000000000000', trim(Cd)), 14)"))
 trf_ident_df = trf_ident_df.withColumn(
     'TpCtrlNorm',
